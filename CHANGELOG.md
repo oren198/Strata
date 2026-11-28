@@ -12,7 +12,8 @@ The store migrates by itself on first start (0029). There is no manual step.
 ### Added
 
 - **Hermes Agent support, one command.** A Hermes Agent profile can act on a Strata scope next to
-  a Claude Code session: `hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata` installs the `strata`
+  a Claude Code session: `hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata` (installs from
+  the repository's default branch) installs the `strata`
   memory provider (a Hermes directory plugin in `integrations/hermes/plugin/strata`; not on PyPI,
   not part of the `strata-mem` package, and with no Python dependencies of its own). The Strata
   engine (`strata-mem` 1.22.0) is downloaded from PyPI on the profile's first chat by Hermes's own package manager, into a side
@@ -23,8 +24,10 @@ The store migrates by itself on first start (0029). There is no manual step.
   35 s including the engine download, the provider survived `hermes pm repair`, and it worked with
   `plugins.isolation: host` (reported, not a guarantee). The test installed the plugin from a
   `file://` clone of this tree and took the identical 1.22.0 wheel from a local index, since 1.22.0
-  was not yet published; the GitHub and PyPI installs are checked after publishing. Limits: Hermes has no turn-end write-back nudge, and chats served through one Hermes
-  gateway are one Strata session. See the README, "Using Strata with Hermes Agent".
+  was not yet published. The GitHub address form was checked separately at a pinned commit (plugin
+  install only); the plain command is checked after the merge, and the PyPI first use after
+  publishing. Limits: Hermes has no turn-end write-back nudge, and chats served through one Hermes
+  gateway are one Strata session (measured 2026-11-27). See the README, "Using Strata with Hermes Agent".
 
 ### Behaviour change
 

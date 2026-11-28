@@ -15,6 +15,8 @@ repository) whose fleet has the scope. Then:
 
     hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata
 
+(This installs from the repository's default branch.)
+
 Answer the prompts (scope, project folder, optional skill, optional judge key) and `y` to "Use
 'strata' as the memory provider now?". The answers go into the profile's own `.env`.
 
@@ -81,8 +83,8 @@ it is not memory until it is judged, and `strata_rejudge` asks again.
 - **No turn-end write-back nudge.** In Claude Code, Strata can stop a session that has read memory
   and written nothing and ask it to contribute. Hermes has no equivalent, so a Hermes agent
   contributes when it chooses to; the system prompt block says how.
-- **Chats served through one gateway are one Strata session.** Measured: two chats on one Hermes
-  gateway were recorded under the same Strata session id. Whether that skews the write-back
+- **Chats served through one gateway are one Strata session.** Two chats on one Hermes
+  gateway were recorded under the same Strata session id (measured 2026-11-27). Whether that skews the write-back
   counters has not been tested.
 - **The engine needs a registered project.** Without `STRATA_PROJECT_DIR` pointing at one it starts
   unbound.

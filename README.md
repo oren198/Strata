@@ -831,8 +831,11 @@ to the other harness verbatim, with its provenance. The plugin took 1 command to
 lazy installs off. Two things differed from what you will run: the test installed the plugin from a
 `file://` clone of this same tree rather than the GitHub address below, and, because 1.22.0 was not
 yet published, Hermes's package manager took the identical 1.22.0 wheel from a local index instead of
-PyPI; the install from PyPI and from GitHub is checked after publishing. Other Hermes versions, the default profile, other operating systems, Windows, and
-service installs of the gateway were not tested, and nothing is claimed for them.
+PyPI. The GitHub address form was checked separately, at a pinned commit (plugin install only); the
+plain command, which installs from the repository's default branch, is checked after the merge, and
+the first use with the engine from PyPI after publishing. Other Hermes versions, the default
+profile, other operating systems, Windows, and service installs of the gateway were not tested, and
+nothing is claimed for them.
 
 **Install: one command.**
 
@@ -844,6 +847,8 @@ service installs of the gateway were not tested, and nothing is claimed for them
    ```
    hermes -p <profile> plugins install https://github.com/oren198/Strata#integrations/hermes/plugin/strata
    ```
+
+   (This installs from the repository's default branch.)
 
    Hermes asks for the scope
    (`STRATA_AGENT_SCOPE`), the project folder (`STRATA_PROJECT_DIR`), an optional skill and an
@@ -891,7 +896,7 @@ test run (a chat read the other harness's item); that is reported, not a guarant
   and written nothing and ask it to contribute. None occurred in Hermes. A Hermes agent contributes
   when it chooses to.
 - **Chats served through one gateway are one Strata session.** Two chats on one Hermes gateway
-  were recorded under the same Strata session id.
+  were recorded under the same Strata session id (measured 2026-11-27).
 - Anything the test did not measure (for example long sessions, several profiles on one scope, or
   the write-back counters) is not claimed.
 
